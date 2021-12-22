@@ -1,0 +1,32 @@
+format data 
+
+/**
+ *  CRC32 as checksum method, will be counted from Command till data. 
+ * 
+ */
+/**
+ * Data framing formation : 
+ * - Header
+ * - Command
+ * - Data length    // 0 ( zero ) if no data 
+ * - Data ( 0 to n )
+ * - CRC3       |
+ * - CRC2       | using CRC32-bit, MSB first
+ * - CRC1       |
+ * - CRC0       |
+ * - ACK/NACK  
+ * - Footer     
+ *      -> ACK/NACK is data-replied to server for status data 
+ *      -> Footer is data received from server
+ * 
+*/
+
+/**
+ * 
+ *  Data position 
+ * 
+ *  Since the data will be cleared after HEADER_DATA 1 and 2 have been found 
+ *  and  UART_START_Flag was true
+ *  All data index will be reset to 0 ( zero ),  and starting to receive for the next data
+ *  until found the END_DATA
+ * */
