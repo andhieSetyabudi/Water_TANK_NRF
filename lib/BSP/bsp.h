@@ -14,7 +14,17 @@
 #include <avr/boot.h>
 #include "EEPROM.h"
 #include "pin_info.h"
-#include "HX710B.h"
+#include "HX711.h"
+#include "button.h"
+
+#include <string.h>
+#include <inttypes.h>
+
+
+
+#ifndef SERIAL_DEBUG
+    #define SERIAL_DEBUG    Serial
+#endif
 
 #define DEV_INFO_ADDR       10
 #define DEV_CAL_PARAM       100
@@ -27,10 +37,12 @@
 #define DEFAULT_MODEL_VERSION   "0.0.1"
 #define DEFAULT_SN              "000000"
 
-#define DEFAULT_SENSOR_OFFSET       75.55255266646f
-#define DEFAULT_SENSOR_GAIN         1.0536452966328E-5
+#define DEFAULT_SENSOR_OFFSET       4294279160.f //75.55255266646f
+#define DEFAULT_SENSOR_GAIN         1.0f         //1.0536452966328E-5
 
 #define WATER_LEVEL_TS          2000UL      // update every 2seconds
+
+#define HOLDTIME_MAX            3000UL     // 1 minute
 
 typedef enum
 {
@@ -61,7 +73,7 @@ typedef struct
     char version [12];                  // versi model 
     char firm_ver [12];                 // versi firmware
     char UUID [MAX_UUID_LENGTH+2];      // UUID
-    char SN[24];                        // Serial Number
+    char SN[10];                        // Serial Number
     uint32_t id_host;
 }DEVICE_INFO;
 
@@ -69,7 +81,9 @@ typedef struct
 {
     float heigth;                       // Heigth of water-level
     float volume;                       // Volume of water in tank
-    float r_tank;                       // Radius of tank ( assume as tube )
+    float baseArea;                     // Base area
+    float vbat;                         // Voltage of battery
+    float bat_percent;                  // Battery gauge in percent
     uint32_t raw_data;                  // Raw data of adc to read height of water level
     byte status_flag;                   // Status flag of sensor
     byte SSR1;                          // Flag of SSR1. 
@@ -124,6 +138,7 @@ float getDeviasion(T (&series)[size_])
     }
     return (sqrt(std / (size_ - 1)));
 }
+
 template <typename T, size_t size_>
 uint64_t str2uint64(T(&series)[size_])
 {
@@ -135,6 +150,42 @@ uint64_t str2uint64(T(&series)[size_])
         tp |= (uint8_t)series[id];
     }
     return tp;
+}
+
+#define MASK_16 (((uint32_t)1<<16)-1) /* i.e., (u_int32_t)0xffff */
+#define FNV1_32_INIT ((uint32_t)2166136261)
+
+#define FNV_32_PRIME ((uint32_t)0x01000193)
+
+template <typename T, size_t size_>
+uint32_t fnv_32_buf(T(&series)[size_], uint32_t hval)
+{
+    unsigned char *bp = (unsigned char *)series;	/* start of buffer */
+    unsigned char *be = bp + size_;		/* beyond end of buffer */
+    /*
+     * FNV-1 hash each octet in the buffer
+     */
+    while (bp < be) {
+	/* multiply by the 32 bit FNV magic prime mod 2^32 */
+#if defined(NO_FNV_GCC_OPTIMIZATION)
+	hval *= FNV_32_PRIME;
+#else
+	hval += (hval<<1) + (hval<<4) + (hval<<7) + (hval<<8) + (hval<<24);
+#endif
+	/* xor the bottom with the current octet */
+	hval ^= (uint32_t)*bp++;
+    }
+    return hval;
+}
+
+template <typename T, size_t size_>
+uint16_t hash(T(&series)[size_])
+{
+    uint16_t hash_;
+    uint32_t hashed=0;
+    hashed = fnv_32_buf(series, hashed);
+    hash_ = (hashed>>16) ^ (hashed & MASK_16);
+    return hash_;
 }
 
 class BSP{
@@ -155,7 +206,16 @@ class BSP{
         static DEVICE_STATUS SENSOR_INIT_CAL(void);
         static void SENSOR_RESET_CAL(void);
 
-        static HX710B waterLevel;
+        // tank parameter 
+        static DEVICE_STATUS TANK_INIT_PARAM(void);
+        static void TANK_RESET_PARAM(void);
+
+        static void isrButton(void);
+
+        static Button userButton;
+        static uint8_t holdState;
+        static uint32_t holdTime;
+        static HX711  waterLevel;
         static uint8_t waterLevel_flag;
         static uint8_t waterLevel_error_count;
     public :
@@ -169,7 +229,6 @@ class BSP{
         static bool updateBOARD_INFO(DEV_INFO_TYPE type, char* txt, uint8_t len);
         // retireve board Information data structure
         static char* BOARD_GET_UUID(char* UUID, uint8_t len);
-        
         static const char* getINFO_MODEL(void){
             return info.MODEL;
         }
@@ -179,19 +238,33 @@ class BSP{
         static const char* getINFO_SN(void){
             return info.SN;
         }
+
+        static void setINFO_SN(const char* SN_);
+
+        
+
         static const char* getINFO_firmware(void){
             return info.firm_ver;
         }
-        static const char* getINFO_UUID(void) {return BSP::info.UUID;}
-        static uint32_t getHOST_ID(void){return info.id_host;}
+        
+        static const char* getINFO_UUID(void) {return (char*)BSP::info.UUID;}
+        static uint16_t getINFO_UUID16(void){
+            uint16_t tmp_id=hash(BSP::info.UUID);
+            return tmp_id;
+        }
 
+        static uint32_t getHOST_ID(void){return info.id_host;}
+        static void setHOST_ID(uint32_t id_);
     //=================================== BOARD INFO function =======================
 
     //=================================== sensor cal param function =================
         static bool updateSENSOR_CAL(CAL_PARAM *var);
         static CAL_PARAM getSENSOR_CAL(void)    { return waterLevelCal;}
+
         static float getSensorConstHeigth(void) {return tank.const_max_height;}
         static float getSensorConstBase(void)   {return tank.const_base_area;}
+        static void setSensorConstBase(float t);
+
     //=================================== sensor cal param function =================
 
     //=================================== sensor reading function ===================
@@ -199,8 +272,15 @@ class BSP{
         static float getHeight(void)        { return param.heigth;}
         static uint32_t getSensorRAW(void)  { return param.raw_data;}
         static byte getSensorStatus(void)   { return param.status_flag;}
-        static byte getMotorStatus(void)    { return param.SSR1;}
-        static void setMotorStatus(byte state) { param.SSR1 = state;}
+        
+        static byte getSW1Status(void)    { return param.SSR1;}
+        static void setSW1Status(byte state) { param.SSR1 = state;}
+
+        static byte getSW2Status(void)    { return param.SSR2;}
+        static void setSW2Status(byte state) { param.SSR2 = state;}
+
+        static float getBatteryVoltage(void)    { return param.vbat;}
+        static float getBatteryPercent(void)    { return param.bat_percent;}
     //=================================== sensor reading function ===================
 
         static void uint32To4bytes(uint32_t res, uint8_t* dest)
@@ -276,7 +356,69 @@ class BSP{
          */
         static bool writeMemory(uint8_t address, uint8_t *pData, size_t len);
 
-        
+        /**
+         * @brief 
+         *          beeper function
+         * @param t     time in 100ms
+         * @param n     numbers of repeated
+         */
+        static void beeper(uint8_t t, uint8_t n)
+        {
+            if(n<=0)
+                n=1;
+            if(t<=0)
+                t = 1;
+            uint16_t hold_t = t*100;
+            while(n>0)
+            {
+                delay(hold_t/2);
+                digitalWrite(BEEP_PIN,HIGH);
+                delay(hold_t);
+                digitalWrite(BEEP_PIN,LOW);
+                n--;
+            }
+        }
+
+        /**
+         * @brief Set the Beeper object
+         * 
+         * @param state : HIGH for turn on the buzzer , LOW for turn it off
+         */
+
+        static void setBeeper(uint8_t state)
+        {
+            if(state)
+                digitalWrite(BEEP_PIN,HIGH);
+            else
+                digitalWrite(BEEP_PIN,LOW);
+        }
+        /**
+         * @brief 
+         *          flashing the light
+         * @param t     time in 100ms
+         * @param n     num of repeated
+         */
+        static void flashing(uint8_t t, uint8_t n)
+        {
+            if(n<=0)
+                n=1;
+            if(t<=0)
+                t = 1;
+            uint16_t hold_t = t*100;
+            while(n>0)
+            {
+                delay(hold_t/2);
+                digitalWrite(LED_PIN,HIGH);
+                delay(hold_t);
+                digitalWrite(LED_PIN,LOW);
+                n--;
+            }
+        }
+
+        // button function
+        static void updateButton(void);
+        static uint8_t getHoldStateButton(void) { return BSP::holdState; }
+
 
         static void print_device_info(void);
 };
