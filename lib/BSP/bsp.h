@@ -42,7 +42,7 @@
 
 #define WATER_LEVEL_TS          2000UL      // update every 2seconds
 
-#define HOLDTIME_MAX            3000UL     // 1 minute
+#define HOLDTIME_MAX            300000UL     // 1 minute
 
 typedef enum
 {
